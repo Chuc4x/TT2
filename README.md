@@ -1,108 +1,113 @@
-# 💵 Sistema de Autenticación de Billetes con Inteligencia Artificial y Visión por Computadora (ESCOM-IPN)
+# Sistema de Detección de Billetes Falsos mediante Visión Artificial y Deep Learning (TT2)
 
-Backend de **Visión por Computadora, Deep Learning (`YOLOv8` / `YOLOv11`) y Pipeline de Reentrenamiento Automatizado (`Active Learning`)** desplegado en **Microsoft Azure** para la detección de billetes apócrifos mediante la inspección automática de **11 candados de seguridad física**.
+API REST y pipeline de visión por computadora para autenticar billetes mexicanos (serie de $500 MXN) identificando sus elementos de seguridad mediante **OpenCV** y modelos de detección de objetos **YOLOv8 / YOLOv11 (`Ultralytics` + `PyTorch`)**, desplegado sobre **Microsoft Azure**.
 
 ---
 
-## 🏗️ Arquitectura del Sistema y Flujo de Automatización
+## Arquitectura del Sistema
+
+El proyecto se divide en tres módulos principales:
+1. **Preprocesamiento de imagen (`OpenCV`):** Segmentación del billete, recorte automático de perspectiva/contorno y mejora adaptativa de contraste y nitidez antes de la inferencia.
+2. ** Inferencia con Deep Learning (`YOLOv8` / `YOLOv11`):** Detección simultánea de 11 elementos de seguridad del billete y evaluación de umbrales de confianza.
+3. **Reentrenamiento continuo (`reentrenamiento.py`):** Descarga automatizada de nuevas muestras desde **Azure File Share**, auto-etiquetado en formato YOLO y actualización de pesos (`best.pt`).
 
 ```mermaid
-flowchart TD
-    A["📱 Cliente Móvil / Script Lote
-(Envía fotografía por HTTP POST)"] --> B["🌐 API REST (Django REST Framework)
-POST /api/subir-imagen/"]
-    B --> C["🔍 Segmentación en Espacio HSV (OpenCV)
-Aísla y recorta el billete del fondo"]
-    C --> D{"📊 Evaluación de Calidad
-Histograma (Contraste) y
-Laplaciano (Nitidez)"}
-    D -- "Bajo Contraste (< 50)" --> E["✨ Ecualización Adaptativa CLAHE
-en Espacio de Color LAB"]
-    D -- "Baja Nitidez (< 100)" --> F["🔪 Filtro de Convolución
-(Sharpening Kernel 3x3)"]
-    D -- "Óptima" --> G["🧠 Inferencia Ultralytics YOLO
-(Detección de 11 Candados)"]
-    E --> G
-    F --> G
-    G --> H["📋 Clasificación por Umbral de Confianza
-(>0.9 Verdadero | 0.6-0.9 Revisar | <0.6 Falso)"]
-    H --> I["📦 Respuesta JSON Estructurada
-(Coordenadas Bounding Box, Confianza e Imagen Base64)"]
-    Cloud["☁️ Azure File Share
-(Nuevas Imágenes en Nube)"] --> J["🔄 Pipeline de Reentrenamiento (reentrenamiento.py)
-Auto-etiquetado YOLO y actualización de Dataset"]
-    J -.-> G
+flowchart LR
+    A["Cliente Web / Movil"] --> B["Django REST API (/api/subir-imagen/)"]
+    B --> C["Segmentacion HSV y Recorte (OpenCV)"]
+    C --> D["Filtro Adaptativo CLAHE / Nitidez"]
+    D --> E["Inferencia YOLOv8 / YOLOv11 (11 clases)"]
+    E --> F["Respuesta JSON + Imagen Anotada"]
+    B --> G["Azure File Share (Reentrenamiento)"]
 ```
 
 ---
 
-## 🔬 Etapas Técnicas del Pipeline
+## Flujo Técnico de Procesamiento (`backend/api/views.py`)
 
-### 1. Segmentación Morfológica y Recorte Automático (`OpenCV`)
-Antes de pasar la imagen a la red neuronal, el endpoint elimina el ruido del fondo:
-* Conversión de `BGR` a espacio de color `HSV` (`cv2.cvtColor`).
-* Aplicación de máscara por umbrales y operaciones morfológicas de cierre (`cv2.MORPH_CLOSE`) y apertura (`cv2.MORPH_OPEN`) con kernel `5x5`.
-* Extracción del contorno externo de mayor área (`cv2.findContours`) y recorte automático de la región de interés (`ROI`).
+### 1. Segmentación y Recorte (`recortar_billete`)
+- Conversión de la imagen de entrada al espacio de color **HSV**.
+- Aplicación de máscara de color y operaciones morfológicas (`cv2.MORPH_CLOSE` y `cv2.MORPH_OPEN`) para aislar el cuerpo del billete frente al fondo.
+- Cálculo del contorno principal (`cv2.findContours`) y extracción de la región de interés (ROI) con margen de seguridad para no perder bordes relevantes.
 
-### 2. Diagnóstico Matemático y Mejora Adaptativa de Imagen
-Para mitigar malas condiciones de iluminación o desenfoque en cámaras móviles:
-* **Detección de bajo contraste:** Calcula la desviación estándar del histograma en escala de grises (`hist.std() < 50`). Si requiere mejora, convierte la imagen al espacio `LAB` y aplica **CLAHE** (`clipLimit=3.0, tileGridSize=(8,8)`) sobre el canal de luminancia `L`.
-* **Detección de desenfoque:** Calcula la varianza del operador **Laplaciano** (`cv2.Laplacian(gray, cv2.CV_64F).var() < 100`). Si detecta baja nitidez, aplica un filtro espacial de realce mediante `cv2.filter2D`.
+### 2. Evaluación de Calidad y Mejora Adaptativa (`evaluar_calidad_imagen` y `mejorar_imagen`)
+- **Cálculo de contraste:** Desviación estándar del histograma en escala de grises.
+- **Cálculo de nitidez:** Varianza del operador Laplaciano (`cv2.Laplacian(gris, cv2.CV_64F).var()`).
+- **Corrección condicional:**
+  - Si el contraste es menor al umbral (`< 82`), convierte la imagen al espacio **LAB** y aplica ecualización adaptativa de histograma **CLAHE** (`clipLimit=1.8`, `tileGridSize=(8,8)`).
+  - Si la nitidez es baja (`< 100`), aplica un filtro de convolución (`cv2.filter2D`) con kernel de enfoque `3x3`.
 
-### 3. Detección de 11 Candados de Seguridad (`YOLOv8` / `YOLOv11`)
-El modelo entrenado evalúa simultáneamente **11 clases (`data.yaml`)** sobre el billete de $500 MXN:
+### 3. Detección de Elementos de Seguridad (`analizar_billete`)
+El modelo entrenado (`best.pt`) evalúa la presencia, posición y porcentaje de confianza de **11 clases definidas en `data.yaml`**:
 
-| ID | Clase / Candado | Elemento Físico Inspeccionado |
-|:---:|:---|:---|
-| `0` | `banco` | Leyenda oficial *"Banco de México"* |
-| `1` | `hilo` | Hilo dinámico 3D de seguridad |
-| `2` | `serie` | Folio / Número de serie principal |
-| `3` | `serie2` | Folio secundario de tamaño creciente |
-| `4` | `numero` | Denominación numérica ($500) con cambio de color |
-| `5` | `texto` | Textos y microtextos de seguridad |
-| `6` | `benito` | Retrato / Efigie principal (Benito Juárez) |
-| `7` | `patron` | Patrones geométricos y fondos lineales |
-| `8` | `marca` | Zona de marca de agua |
-| `9` | `carruaje` | Viñeta histórica de seguridad |
-| `10` | `billete` | Encuadre e integridad general del billete |
+| ID | Clase | Elemento verificado en el billete ($500 MXN) |
+| :--- | :--- | :--- |
+| `0` | `banco` | Leyenda "Banco de México" |
+| `1` | `hilo` | Hilo dinámico / banda de seguridad |
+| `2` | `serie` | Folio / número de serie principal |
+| `3` | `serie2` | Segundo número de serie |
+| `4` | `numero` | Denominación numérica (500) |
+| `5` | `texto` | Leyenda "Quinientos Pesos" |
+| `6` | `benito` | Efigie principal (Benito Juárez) |
+| `7` | `patron` | Patrón geométrico de seguridad |
+| `8` | `marca` | Marca de agua |
+| `9` | `carruaje` | Viñeta histórica / elemento gráfico secundario |
+| `10` | `billete` | Cuerpo íntegro del billete |
 
 ---
 
-## 📡 Ejemplo de Respuesta de la API REST (`POST /api/subir-imagen/`)
+## Pipeline de Reentrenamiento Automatizado (`reentrenamiento.py`)
 
-```json
-{
-  "mensaje": "Billete mejorado y guardado exitosamente.",
-  "billete_id": 42,
-  "imagen_base64": "/9j/4AAQSkZJRgABAQAAAQABAAD...",
-  "detecciones": [
-    {
-      "candado": "hilo",
-      "confianza": 0.964,
-      "coordenadas": [142, 85, 210, 690],
-      "clasificacion": "verdadero"
-    },
-    {
-      "candado": "serie",
-      "confianza": 0.941,
-      "coordenadas": [820, 510, 1140, 585],
-      "clasificacion": "verdadero"
-    }
-  ]
-}
+Para mejorar la precisión del modelo frente a distintas condiciones de iluminación y cámaras móviles, el script `reentrenamiento.py` implementa un ciclo de aprendizaje continuo:
+1. Conecta con **Azure File Share** mediante el SDK `azure-storage-fileshare` usando credenciales en variables de entorno (`AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`).
+2. Descarga los lotes de imágenes capturados en el servidor de producción.
+3. Ejecuta inferencia con los pesos actuales (`best.pt`) y genera automáticamente los archivos de etiquetas `.txt` con coordenadas normalizadas (`class_id x_center y_center width height`).
+4. Lanza el proceso de entrenamiento incremental con `Ultralytics YOLO` (`epochs=50`, `imgsz=640`, `batch=8`) y respalda los artefactos generados.
+
+---
+
+## Estructura del Proyecto
+
+```text
+TT2/
+├── backend/
+│   ├── api/
+│   │   ├── views.py          # Endpoint REST, preprocesamiento OpenCV e inferencia YOLO
+│   │   ├── urls.py           # Rutas de la API (/api/subir-imagen/)
+│   │   └── models.py
+│   ├── backend/
+│   │   ├── settings.py       # Configuración Django, CORS y almacenamiento
+│   │   └── wsgi.py           # Punto de entrada WSGI para Gunicorn en Azure
+│   └── manage.py
+├── reentrenamiento.py        # Pipeline de descarga desde Azure y reentrenamiento YOLO
+├── data.yaml                 # Definición de las 11 clases del dataset
+├── startup.sh                # Script de arranque para Azure App Service (Linux)
+└── requirements.txt          # Dependencias (Django, DRF, PyTorch, Ultralytics, OpenCV, Azure SDK)
 ```
 
 ---
 
-## 🔄 Automatización de Reentrenamiento con Azure File Share (`reentrenamiento.py`)
-El repositorio incluye un pipeline automatizado de **Active Learning**:
-1. Se conecta vía SDK (`azure-storage-fileshare`) al almacenamiento en la nube donde se depositan nuevas capturas.
-2. Envía cada imagen al motor de inferencia y verifica si contiene el conjunto completo de candados requeridos.
-3. Convierte automáticamente las coordenadas `xyxy` al formato normalizado de YOLO (`class x_center y_center width height`) y genera los archivos `.txt` de entrenamiento en `dataset/labels/train/`.
+## Ejecución Local
 
----
+```bash
+# 1. Clonar el repositorio y crear entorno virtual
+git clone https://github.com/Chuc4x/TT2.git
+cd TT2
+python -m venv venv
+source venv/bin/activate  # En Windows: venv\Scripts\activate
 
-## 🛠️ Stack y Despliegue
-* **Backend & API:** `Python 3.11+`, `Django 5.1`, `Django REST Framework`, `Gunicorn`
-* **Visión Artificial & IA:** `Ultralytics YOLOv8 / YOLOv11`, `PyTorch`, `OpenCV (cv2)`, `NumPy`, `Pillow`
-* **Cloud & CI/CD:** `Microsoft Azure App Service (Linux)`, `Azure File Share`, `GitHub Actions`
+# 2. Instalar dependencias
+pip install -r requirements.txt
+
+# 3. Iniciar servidor de desarrollo Django
+cd backend
+python manage.py migrate
+python manage.py runserver
+```
+
+### Ejemplo de petición al Endpoint
+
+```bash
+curl -X POST http://localhost:8000/api/subir-imagen/ \
+  -F "imagen=@billete_500.jpg"
+```
