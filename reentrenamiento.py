@@ -8,7 +8,7 @@ import uuid
 
 # --- Configuración de Azure ---
 AZURE_STORAGE_ACCOUNT_NAME = "dbilletesescom"
-AZURE_STORAGE_ACCOUNT_KEY = "YXrFRSTMHGoybtuZK+klpgl2TSzY9M+27iD5Y2JdKRYzC2fQPrURYlSGz9/a6A20ks16I/ENGcY4+AStcvOk0g=="
+AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "")  # Cargado desde variables de entorno por seguridad
 AZURE_FILE_SHARE_NAME = "dbilletesescom"
 AZURE_FILE_DIRECTORY = "imagenes"
 
